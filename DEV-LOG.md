@@ -1,5 +1,373 @@
 # DEV-LOG
 
+## Daemon + Remote Control Server 还原 (2026-04-07)
+
+**分支**: `feat/daemon-remote-control-server`
+
+### 背景
+
+`src/commands.ts` 注册了 `remoteControlServer` 命令（双重门控 `feature('DAEMON') && feature('BRIDGE_MODE')`），但 `src/commands/remoteControlServer/` 目录缺失，`src/daemon/main.ts` 和 `src/daemon/workerRegistry.ts` 均为 stub。官方 CLI 2.1.92 中情况一致——Anthropic 已预留注册点和底层 `runBridgeHeadless()` 实现，但中间层（daemon supervisor + command 入口）未发布。
+
+通过逐级反向追踪调用链还原完整实现：
+```
+/remote-control-server (slash command)
+  → spawn: claude daemon start
+    → daemonMain() (supervisor，管理 worker 生命周期)
+      → spawn: claude --daemon-worker=remoteControl
+        → runDaemonWorker('remoteControl')
+          → runBridgeHeadless(opts, signal)  ← 已有完整实现
+            → runBridgeLoop() → 接受远程会话
+```
+
+### 实现
+
+#### 1. Worker Registry（`src/daemon/workerRegistry.ts`）
+
+从 stub 还原为 worker 分发器：
+- `runDaemonWorker(kind)` 按 `kind` 分发到不同 worker 实现
+- `runRemoteControlWorker()` 从环境变量（`DAEMON_WORKER_*`）读取配置，构造 `HeadlessBridgeOpts`，调用 `runBridgeHeadless()`
+- 区分 permanent（`EXIT_CODE_PERMANENT = 78`）和 transient 错误，supervisor 据此决定重试或 park
+- SIGTERM/SIGINT 信号处理，通过 `AbortController` 传递给 bridge loop
+
+#### 2. Daemon Supervisor（`src/daemon/main.ts`）
+
+从 stub 还原为完整 supervisor 进程：
+- `daemonMain(args)` 支持子命令：`start`（启动）、`status`、`stop`、`--help`
+- `runSupervisor()` spawn `remoteControl` worker 子进程，通过环境变量传递配置
+- 指数退避重启（2s → 120s），10s 内连续崩溃 5 次则 park worker
+- permanent exit code（78）直接 park，不重试
+- graceful shutdown：SIGTERM → 转发给 worker → 30s grace → SIGKILL
+- CLI 参数支持：`--dir`、`--spawn-mode`、`--capacity`、`--permission-mode`、`--sandbox`、`--name`
+
+#### 3. Remote Control Server 命令（`src/commands/remoteControlServer/`）
+
+**`index.ts`** — Command 注册：
+- 类型 `local-jsx`，名称 `/remote-control-server`，别名 `/rcs`
+- 双 feature 门控：`feature('DAEMON') && feature('BRIDGE_MODE')` + `isBridgeEnabled()`
+- lazy load `remoteControlServer.tsx`
+
+**`remoteControlServer.tsx`** — REPL 内 UI：
+- 首次调用：前置检查（bridge 可用性 + OAuth token）→ spawn daemon 子进程
+- 再次调用：弹出管理对话框（停止/重启/继续），显示 PID 和最近 5 行日志
+- 模块级 state 跨调用保持 daemon 进程引用
+- graceful stop：SIGTERM → 10s grace → SIGKILL
+
+#### 4. Feature Flag 启用
+
+`build.ts` / `scripts/dev.ts`：`DEFAULT_BUILD_FEATURES` / `DEFAULT_FEATURES` 新增 `DAEMON`
+
+DAEMON 仅有编译时 feature flag 门控，无 GrowthBook gate。
+
+### 与 `/remote-control` 的区别
+
+| | `/remote-control` | `/remote-control-server` (daemon) |
+|---|---|---|
+| 模式 | 单会话，REPL 内交互式 bridge | 多会话，daemon 持久化服务器 |
+| 生命周期 | 跟 REPL 会话绑定 | 独立后台进程，崩溃自动重启 |
+| 并发 | 1 个远程连接 | 默认 4 个，可配置 `--capacity` |
+| 隔离 | 共享当前目录 | 支持 `worktree` 模式隔离 |
+| 底层 | `initReplBridge()` | `runBridgeHeadless()` → `runBridgeLoop()` |
+
+### 修改文件
+
+| 文件 | 变更 |
+|------|------|
+| `build.ts` | `DEFAULT_BUILD_FEATURES` 新增 `DAEMON` |
+| `scripts/dev.ts` | `DEFAULT_FEATURES` 新增 `DAEMON` |
+| `src/daemon/main.ts` | 从 stub 还原为 supervisor 实现 |
+| `src/daemon/workerRegistry.ts` | 从 stub 还原为 worker 分发器 |
+| `src/commands/remoteControlServer/index.ts` | **新增** command 注册 |
+| `src/commands/remoteControlServer/remoteControlServer.tsx` | **新增** REPL UI |
+
+### 验证
+
+| 项目 | 结果 |
+|------|------|
+| `bun run build` | ✅ 成功 (490 files) |
+| tsc 新文件检查 | ✅ 无新增类型错误 |
+
+### 使用方式
+
+```bash
+# CLI 直接启动 daemon
+bun run dev daemon start
+bun run dev daemon start --spawn-mode=worktree --capacity=8
+
+# REPL 内
+/remote-control-server   # 或 /rcs
+```
+
+前提：需要 Anthropic OAuth 登录（`claude login`）。
+
+---
+
+## /ultraplan 启用 + GrowthBook Fallback 加固 + Away Summary 改进 (2026-04-06)
+
+**分支**: `feat/ultraplan-enablement`
+**Commit**: `feat: enable /ultraplan and harden GrowthBook fallback chain`
+
+### 背景
+
+`/ultraplan` 是 Claude Code 的高级多代理规划功能：将任务发送到 Claude Code on the web（CCR），由 Opus 进行深度规划，计划完成后返回终端供用户审批和执行。此功能被 3 层门控锁定：`feature('ULTRAPLAN')` 编译 flag + `isEnabled: () => USER_TYPE === 'ant'` + `INTERNAL_ONLY_COMMANDS` 列表。
+
+另外发现 GrowthBook fallback 链在 config 未初始化时会抛异常跳过 `LOCAL_GATE_DEFAULTS`，以及 Away Summary 在不支持 DECSET 1004 focus 事件的终端（CMD/PowerShell）上不工作。
+
+### 实现
+
+#### 1. Ultraplan 启用
+
+- `build.ts` / `scripts/dev.ts`: 添加 `ULTRAPLAN` 到默认编译 flag
+- `src/commands.ts`: 将 ultraplan 从 `INTERNAL_ONLY_COMMANDS` 移入公开 `COMMANDS` 列表
+- `src/commands/ultraplan.tsx`: `isEnabled` 改为 `() => true`
+- `src/screens/REPL.tsx`: 添加 `UltraplanChoiceDialog`、`UltraplanLaunchDialog`、`launchUltraplan` 的 import（HEAD 版使用但未 import，构建报 `not defined`）
+
+#### 2. 反编译 UltraplanChoiceDialog / UltraplanLaunchDialog
+
+REPL.tsx 引用这两个组件但代码库中不存在。从官方 CLI 2.1.92 的 `cli.js` 中定位 minified 函数 `M15`（UltraplanChoiceDialog）和 `P15`（UltraplanLaunchDialog），通过符号映射表反编译为可读 TSX。
+
+**`src/components/ultraplan/UltraplanChoiceDialog.tsx`** — 远程计划批准后的选择对话框：
+- 3 个选项：Implement here（注入当前会话）/ Start new session（清空会话重开）/ Cancel（保存到 .md 文件）
+- 可滚动计划预览（ctrl+u/d 翻页，鼠标滚轮），自适应终端高度
+- 选择后标记远程 task 完成、清除 `ultraplanPendingChoice` 状态、归档远程 CCR session
+
+**`src/components/ultraplan/UltraplanLaunchDialog.tsx`** — 启动确认对话框：
+- 显示功能说明、时间估计（~10–30 min）、服务条款链接
+- 处理 Remote Control bridge 冲突（选择 run 时自动断开 bridge）
+- 首次使用时持久化 `hasSeenUltraplanTerms` 到全局配置
+
+反编译要点：剥离 React Compiler `_c(N)` 缓存数组，还原为标准 `useMemo`/`useCallback`；`useFocusedInputDialog()` 注册 hook 省略（REPL 内部计算 `focusedInputDialog`）；GrowthBook 配置查询替换为本地默认值。
+
+#### 3. GrowthBook Fallback 加固
+
+`src/services/analytics/growthbook.ts`:
+- `getFeatureValue_CACHED_MAY_BE_STALE`: 将 `getLocalGateDefault()` 查找移到 try/catch 外层
+- `checkStatsigFeatureGate_CACHED_MAY_BE_STALE`: 同上，config 读取包裹在 try/catch 中
+
+修复前：config 未初始化 → `getGlobalConfig()` 抛异常 → catch 直接返回 `defaultValue` → 跳过 `LOCAL_GATE_DEFAULTS`
+修复后：config 未初始化 → catch 静默 → 继续查 `LOCAL_GATE_DEFAULTS` → 有默认值就用，没有才 fallback
+
+#### 4. Away Summary 改进（Windows 终端兼容）
+
+**问题**：Away Summary（`feature('AWAY_SUMMARY')` + `tengu_sedge_lantern` gate，上一轮已启用）依赖 DECSET 1004 终端 focus 事件检测用户是否离开。但 Windows 的 CMD 和 PowerShell 不支持此协议，`getTerminalFocusState()` 始终返回 `'unknown'`，原逻辑对 `'unknown'` 状态执行 no-op，导致 Windows 用户永远无法触发离开摘要。
+
+**修改**：`src/hooks/useAwaySummary.ts`
+
+1. **focus 状态处理**：`'unknown'` 现在视同 `'blurred'`（可能已离开），订阅时即启动 idle timer（5 分钟）
+2. **idle-based 在场检测**：新增 `isLoading` 转换监听作为用户活跃信号替代 focus 事件：
+   - 用户发起新 turn（`isLoading` → `true`）→ 说明在场，取消 idle timer + abort 进行中的生成
+   - turn 结束（`isLoading` → `false`）→ 重启 idle timer
+   - timer 到期且无进行中 turn → 触发 away summary 生成
+3. **兼容性**：仅在 `getTerminalFocusState() === 'unknown'` 时激活 idle 逻辑，支持 DECSET 1004 的终端（iTerm2、Windows Terminal、kitty 等）仍走原有 blur/focus 路径
+
+**效果**：Windows CMD/PowerShell 用户离开终端 5 分钟后，系统自动调用 API 生成摘要并作为 `away_summary` 类型的系统消息追加到对话流中，用户回来时直接在 UI 中看到，无需执行任何命令
+
+#### 5. Cron 定时任务管理技能
+
+`src/skills/bundled/cronManage.ts`（**新增**）+ `src/skills/bundled/index.ts`：
+
+KAIROS 定时任务系统（`tengu_kairos_cron` gate，已在上一轮 GrowthBook 启用中开启）提供了 `ScheduleCronTool` 来创建定时任务，但缺少用户可调用的 list/delete 技能。新增两个 bundled skill 补全管理闭环：
+
+| 技能 | 用法 | 功能 |
+|------|------|------|
+| `/cron-list` | `/cron-list` | 调用 `CronListTool` 列出所有定时任务，表格显示 ID、Schedule、Prompt、Recurring、Durable |
+| `/cron-delete` | `/cron-delete <job-id>` | 调用 `CronDeleteTool` 按 ID 取消指定定时任务 |
+
+两个技能均受 `isKairosCronEnabled()` 门控（`feature('AGENT_TRIGGERS') && tengu_kairos_cron` gate），与 `ScheduleCronTool` 保持一致。
+
+#### 6. Fullscreen 门控修复
+
+- `src/utils/fullscreen.ts`: `isFullscreenEnvEnabled()` 从无条件返回 `true` 改为 `process.env.USER_TYPE === 'ant'`，避免非 ant 用户意外触发全屏模式
+
+### 修改文件
+
+| 文件 | 变更 |
+|------|------|
+| `build.ts` | `DEFAULT_BUILD_FEATURES` 新增 `ULTRAPLAN` |
+| `scripts/dev.ts` | `DEFAULT_FEATURES` 新增 `ULTRAPLAN` |
+| `src/commands.ts` | ultraplan 移入公开命令列表 |
+| `src/commands/ultraplan.tsx` | `isEnabled` 移除 ant-only 限制 |
+| `src/components/ultraplan/UltraplanChoiceDialog.tsx` | **新增** 从 2.1.92 反编译 |
+| `src/components/ultraplan/UltraplanLaunchDialog.tsx` | **新增** 从 2.1.92 反编译 |
+| `src/screens/REPL.tsx` | 添加 3 个 import |
+| `src/services/analytics/growthbook.ts` | fallback 链加固 |
+| `src/hooks/useAwaySummary.ts` | idle-based 离开检测 |
+| `src/skills/bundled/index.ts` | 注册 cron 技能 |
+| `src/skills/bundled/cronManage.ts` | **新增** cron list/delete 技能 |
+| `src/utils/fullscreen.ts` | fullscreen 门控修复 |
+
+### 验证
+
+| 项目 | 结果 |
+|------|------|
+| `bun run build` | ✅ 成功 (480 files) |
+| `bun run lint` | ✅ 仅已有 biome-ignore 警告 |
+| `/ultraplan` 手动测试 | ✅ 命令注册可见、能启动远程会话、能接收回传计划并显示 ChoiceDialog |
+
+### Ultraplan 工作流
+
+```
+/ultraplan <prompt>
+  → UltraplanLaunchDialog 确认
+  → teleportToRemote 创建 CCR 远程会话
+  → pollForApprovedExitPlanMode 轮询（3s 间隔，30min 超时）
+  → ExitPlanModeScanner 解析事件流
+  → 计划 approved → UltraplanChoiceDialog 显示选择
+  → Implement here / Start new session / Cancel
+```
+
+需要 Anthropic OAuth（`/login`）。远程会话在 claude.ai/code 上运行。
+
+---
+
+## GrowthBook Local Gate Defaults + P0/P1 Feature Enablement (2026-04-06)
+
+**分支**: `feat/growthbook-enablement`
+
+### 背景
+
+Claude Code 使用 GrowthBook（Anthropic 自建 proxy at api.anthropic.com）进行远程功能开关控制，代码中使用 `tengu_*` 前缀命名。在反编译版本中 GrowthBook 不启动（analytics 空实现），导致 70+ 个功能被 gate 拦截。
+
+经 4 个并行研究代理深度分析，确认**所有被 gate 控制的功能代码都是真实现**（非 stub）。
+
+### 实现方案
+
+**Commit 1** (`feat`): 在 `growthbook.ts` 中添加 `LOCAL_GATE_DEFAULTS` 映射表（25+ boolean gates + 2 object config gates），修改 4 个 getter 函数在 `isGrowthBookEnabled() === false` 时查找本地默认值。
+
+**Commit 2** (`fix`): 发现 `LOCAL_GATE_DEFAULTS` 在有 API key 的用户环境下无效——因为 `isGrowthBookEnabled()` 返回 `true`（analytics 未禁用），代码走 GrowthBook 路径但缓存为空，直接返回 `defaultValue` 跳过了本地默认值。修复：在 3 个 getter 函数的缓存 miss 路径中插入 `LOCAL_GATE_DEFAULTS` 查找。同时修复 `tengu_onyx_plover` 值类型（`JSON.stringify` → 直接对象）和新增 `tengu_kairos_brief_config` 对象型 gate。
+
+修复后的 fallback 链：
+```
+env overrides → config overrides → [GrowthBook 启用?]
+  → 内存缓存 → 磁盘缓存 → LOCAL_GATE_DEFAULTS → defaultValue
+```
+
+可通过 `CLAUDE_CODE_DISABLE_LOCAL_GATES=1` 环境变量一键禁用。
+
+### 启用的功能
+
+**P0 — 纯本地功能（7 个 gate）：**
+
+| Gate | 功能 |
+|------|------|
+| `tengu_keybinding_customization_release` | 自定义快捷键（~/.claude/keybindings.json） |
+| `tengu_streaming_tool_execution2` | 流式工具执行（边收边执行） |
+| `tengu_kairos_cron` | 定时任务系统 |
+| `tengu_amber_json_tools` | Token 高效 JSON 工具格式（省 ~4.5%） |
+| `tengu_immediate_model_command` | 运行中即时切换模型 |
+| `tengu_basalt_3kr` | MCP 指令增量传输 |
+| `tengu_pebble_leaf_prune` | 会话存储叶剪枝优化 |
+
+**P1 — API 依赖功能（8 个 gate）：**
+
+| Gate | 功能 |
+|------|------|
+| `tengu_session_memory` | 会话记忆（跨会话上下文持久化） |
+| `tengu_passport_quail` | 自动记忆提取 |
+| `tengu_chomp_inflection` | 提示建议 |
+| `tengu_hive_evidence` | 验证代理（对抗性验证） |
+| `tengu_kairos_brief` | Brief 精简输出模式 |
+| `tengu_sedge_lantern` | 离开摘要 |
+| `tengu_onyx_plover` | 自动梦境（记忆巩固） |
+| `tengu_willow_mode` | 空闲返回提示 |
+
+**Kill Switch（10 个 gate 保持 true）：**
+
+`tengu_turtle_carbon`、`tengu_amber_stoat`、`tengu_amber_flint`、`tengu_slim_subagent_claudemd`、`tengu_birch_trellis`、`tengu_collage_kaleidoscope`、`tengu_compact_cache_prefix`、`tengu_kairos_cron_durable`、`tengu_attribution_header`、`tengu_slate_prism`
+
+**新增编译 flag：**
+
+| Flag | build.ts | dev.ts | 用途 |
+|------|:--------:|:------:|------|
+| `AGENT_TRIGGERS` | ON | ON | 定时任务系统 |
+| `EXTRACT_MEMORIES` | ON | ON | 自动记忆提取 |
+| `VERIFICATION_AGENT` | ON | ON | 对抗性验证代理 |
+| `KAIROS_BRIEF` | ON | ON | Brief 精简模式 |
+| `AWAY_SUMMARY` | ON | ON | 离开摘要 |
+| `ULTRATHINK` | ON | ON | Ultrathink 扩展思考（双重门控修复） |
+| `BUILTIN_EXPLORE_PLAN_AGENTS` | ON | ON | 内置 Explore/Plan agents（双重门控修复） |
+| `LODESTONE` | ON | ON | Deep link 协议注册（双重门控修复） |
+
+**排除的编译 flag：**
+- `KAIROS` — 拉入 `useProactive.js`（缺失文件），`KAIROS_BRIEF` 足够
+- `TERMINAL_PANEL` — 拉入 `TerminalCaptureTool`（缺失文件）
+
+**双重门控修复说明：**
+部分功能同时被编译 flag 和 GrowthBook gate 控制（双重门控），仅开 GrowthBook gate 不够。
+审计发现 3 个被卡住的：`ULTRATHINK`、`BUILTIN_EXPLORE_PLAN_AGENTS`、`LODESTONE`。
+
+### 修改文件
+
+| 文件 | 变更 |
+|------|------|
+| `build.ts` | `DEFAULT_BUILD_FEATURES` 新增 8 个编译 flag |
+| `scripts/dev.ts` | `DEFAULT_FEATURES` 新增 8 个编译 flag |
+| `src/services/analytics/growthbook.ts` | 新增 `LOCAL_GATE_DEFAULTS` 映射（27 gates）+ `getLocalGateDefault()` + 修改 4 个 getter 的 fallback 链 |
+| `scripts/verify-gates.ts` | 新增 gate 验证脚本（30 gates） |
+| `docs/features/growthbook-enablement-plan.md` | 完整研究报告和启用计划 |
+| `docs/features/feature-flags-audit-complete.md` | 更新启用状态表 |
+
+### 验证
+
+| 项目 | 结果 |
+|------|------|
+| `bun run build` | ✅ 成功 (481 files) |
+| `bun test` | ✅ 2106 pass / 23 fail（均为已有问题）/ 0 新增失败 |
+| `verify-gates.ts` | ✅ 30/30 PASS |
+| `/brief` 手动测试 | ✅ 可用（fallback 修复后） |
+
+---
+
+## Enable SHOT_STATS, TOKEN_BUDGET, PROMPT_CACHE_BREAK_DETECTION (2026-04-05)
+
+**PR**: [claude-code-best/claude-code#140](https://github.com/claude-code-best/claude-code/pull/140)
+**分支**: `feat/enable-safe-feature-flags`
+
+对 22 个被标记为 "COMPLETE" 的编译时 feature flag 进行实际源码验证（6 个并行子代理 + Codex CLI 独立复核），发现审计报告存在大量误判。最终确认仅 3 个 flag 为真正 compile-only，安全启用。
+
+**验证流程：**
+
+1. 6 个并行子代理分别检查每个 flag 的 `feature('FLAG_NAME')` 引用点、依赖模块完整性、外部服务依赖
+2. Codex CLI (v0.118.0, 240K tokens) 独立复核，将原 7 个 "compile-only" 进一步缩减为 3 个
+3. 3 个专项代理逐一验证代码路径完整性和运行时安全性
+
+**新启用的 3 个 flag：**
+
+| Flag | 功能 | 用户可感知效果 |
+|------|------|---------------|
+| `SHOT_STATS` | shot 分布统计 | `/stats` 面板显示 shot 分布和 one-shot rate |
+| `TOKEN_BUDGET` | token 预算目标 | 支持 `+500k` / `spend 2M tokens` 语法，自动续写直到达标，带进度条 |
+| `PROMPT_CACHE_BREAK_DETECTION` | cache key 变化检测 | 内部诊断，`--debug` 模式可见，写 diff 到临时目录 |
+
+**修改文件：**
+
+| 文件 | 变更 |
+|------|------|
+| `build.ts` | `DEFAULT_BUILD_FEATURES` 新增 3 个 flag |
+| `scripts/dev.ts` | `DEFAULT_FEATURES` 新增 3 个 flag |
+| `package.json` / `bun.lock` | 新增 `openai` 依赖（OpenAI 兼容层需要） |
+
+**新增文档：**
+
+| 文件 | 说明 |
+|------|------|
+| `docs/features/feature-flags-codex-review.md` | Codex 独立复核报告：修正后的 5 类分类、恢复优先级、三轴分类标准建议 |
+| `docs/features/feature-flags-audit-complete.md` | 标记所有已启用 flag 的状态（`[build: ON]` / `[dev: ON]`） |
+
+**Codex 复核关键发现：**
+
+- 原 22 个 "COMPLETE" flag 中，8 个核心模块是 stub，3 个依赖远程服务
+- `TEAMMEM`、`AGENT_TRIGGERS`、`EXTRACT_MEMORIES`、`KAIROS_BRIEF` 被降级为"有条件可用"（受 GrowthBook 门控）
+- 建议审计分类标准改为三轴：实现完整度 × 激活条件 × 运行风险
+- 恢复优先级：REACTIVE_COMPACT > BG_SESSIONS > PROACTIVE > CONTEXT_COLLAPSE
+
+**验证结果：**
+
+- `bun run build` → 475 files ✅
+- `bun test` → 零新增失败 ✅
+- 3 个 flag 代码路径全部完整，无缺失依赖，无 crash 风险 ✅
+
+---
+
 ## /dream 手动触发 + DreamTask 类型补全 (2026-04-04)
 
 将 `/dream` 命令从 KAIROS feature gate 中解耦，作为 bundled skill 无条件注册；补全 DreamTask 类型存根。
@@ -38,6 +406,7 @@
 ---
 
 ## Computer Use Windows 增强：窗口绑定截图 + UI Automation + OCR (2026-04-03)
+
 
 在三平台基础实现之上，利用 Windows 原生 API 增强 Computer Use 的 Windows 专属能力。
 
@@ -117,23 +486,6 @@ packages/@ant/computer-use-{input,swift}/src/
 |------|------|
 | `vendor/audio-capture/{platform}/audio-capture.node` | 6 个平台的原生音频二进制（cpal，来自参考项目） |
 | `vendor/audio-capture-src/index.ts` | 原生模块加载器（按 `${arch}-${platform}` 动态 require `.node`） |
-
-**修改文件：**
-
-| 文件 | 变更 |
-|------|------|
-| `packages/audio-capture-napi/src/index.ts` | SoX 子进程 stub → 原生 `.node` 加载器（含 `process.cwd()` workspace 路径 fallback） |
-| `scripts/dev.ts` | `DEFAULT_FEATURES` 加 `"VOICE_MODE"` |
-| `build.ts` | `DEFAULT_BUILD_FEATURES` 加 `"VOICE_MODE"` |
-| `docs/features/voice-mode.md` | 追加恢复计划章节（第八节） |
-
-**验证结果：**
-
-- `isNativeAudioAvailable()` → `true`（Windows x64 原生 `.node` 加载成功）
-- `feature('VOICE_MODE')` → `ENABLED`
-- `bun run build` → voice 代码编入产物
-
-**运行时前置条件：** claude.ai OAuth 登录 + 麦克风权限
 
 ---
 

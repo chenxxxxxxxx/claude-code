@@ -159,30 +159,33 @@ export const apps: AppsAPI = {
 
   async listInstalled() {
     try {
-      // Use Spotlight (mdfind) to enumerate .app bundles and mdls to get real bundle IDs.
-      // Searches /Applications, /System/Applications, and /System/Applications/Utilities
-      // so that system apps (Terminal, Chess, etc.) and core services (Finder) are found.
-      const proc = Bun.spawn([
-        'bash', '-c',
-        `for dir in /Applications /System/Applications /System/Applications/Utilities /System/Library/CoreServices; do
-mdfind 'kMDItemContentType == "com.apple.application-bundle"' -onlyin "$dir" 2>/dev/null
-done | sort -u | while read -r appPath; do
-bundleId=$(mdls -raw -name kMDItemCFBundleIdentifier "$appPath" 2>/dev/null)
-if [ -n "$bundleId" ] && [ "$bundleId" != "(null)" ]; then
-  displayName=$(basename "$appPath" .app)
-  echo "$bundleId|$displayName|$appPath"
-fi
-done`,
-      ], { stdout: 'pipe', stderr: 'pipe' })
-      const text = await new Response(proc.stdout).text()
-      await proc.exited
-      return text.split('\n').filter(Boolean).map(line => {
-        const [bundleId, displayName, path] = line.split('|', 3)
-        return {
-          bundleId: bundleId ?? '',
-          displayName: displayName ?? '',
-          path: path ?? '',
+      // Use mdls to enumerate apps and get real bundle identifiers.
+      // The previous AppleScript approach generated fake bundle IDs
+      // (com.app.display-name) which prevented request_access from matching
+      // apps by their real bundle ID (e.g. com.google.Chrome).
+      const dirs = ['/Applications', '~/Applications', '/System/Applications']
+      const allApps: InstalledApp[] = []
+      for (const dir of dirs) {
+        const expanded = dir.startsWith('~') ? join(process.env.HOME ?? '~', dir.slice(1)) : dir
+        const proc = Bun.spawn(
+          ['bash', '-c', `for f in "${expanded}"/*.app; do [ -d "$f" ] || continue; bid=$(mdls -name kMDItemCFBundleIdentifier "$f" 2>/dev/null | sed 's/.*= "//;s/"//'); name=$(basename "$f" .app); echo "$f|$name|$bid"; done`],
+          { stdout: 'pipe', stderr: 'pipe' },
+        )
+        const text = await new Response(proc.stdout).text()
+        await proc.exited
+        for (const line of text.split('\n').filter(Boolean)) {
+          const [path, displayName, bundleId] = line.split('|', 3)
+          if (path && displayName && bundleId && bundleId !== '(null)') {
+            allApps.push({ bundleId, displayName, path })
+          }
         }
+      }
+      // Deduplicate by bundleId (prefer /Applications over ~/Applications)
+      const seen = new Set<string>()
+      return allApps.filter(app => {
+        if (seen.has(app.bundleId)) return false
+        seen.add(app.bundleId)
+        return true
       })
     } catch {
       return []

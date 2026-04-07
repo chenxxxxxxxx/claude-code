@@ -34,7 +34,8 @@
   ],
   "files": [
     "dist",
-    "scripts/download-ripgrep.ts"
+    "scripts/download-ripgrep.ts",
+    "scripts/postinstall.cjs"
   ],
   "scripts": {
     "build": "bun run build.ts",
@@ -48,12 +49,12 @@
     "test": "bun test",
     "check:unused": "knip-bun",
     "health": "bun run scripts/health-check.ts",
-    "postinstall": "node dist/download-ripgrep.js || bun run scripts/download-ripgrep.ts || true",
+    "postinstall": "node scripts/postinstall.cjs",
     "docs:dev": "npx mintlify dev"
   },
   "dependencies": {},
   "devDependencies": {
-    "openai": "^4.73.0",
+    "openai": "^6.33.0",
     "@alcalzone/ansi-tokenize": "^0.3.0",
     "@ant/claude-for-chrome-mcp": "workspace:*",
     "@ant/computer-use-input": "workspace:*",
@@ -130,6 +131,7 @@
     "highlight.js": "^11.11.1",
     "https-proxy-agent": "^8.0.0",
     "ignore": "^7.0.5",
+    "@anthropic/ink": "workspace:*",
     "image-processor-napi": "workspace:*",
     "indent-string": "^5.0.0",
     "jsonc-parser": "^3.3.1",

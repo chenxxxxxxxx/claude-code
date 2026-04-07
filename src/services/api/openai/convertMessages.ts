@@ -75,6 +75,7 @@ function convertInternalUserMessage(
   } else if (Array.isArray(content)) {
     const textParts: string[] = []
     const toolResults: BetaToolResultBlockParam[] = []
+    const imageParts: Array<{ type: 'image_url'; image_url: { url: string } }> = []
 
     for (const block of content) {
       if (typeof block === 'string') {
@@ -83,19 +84,39 @@ function convertInternalUserMessage(
         textParts.push(block.text)
       } else if (block.type === 'tool_result') {
         toolResults.push(block as BetaToolResultBlockParam)
+      } else if (block.type === 'image') {
+        const imagePart = convertImageBlockToOpenAI(block as Record<string, unknown>)
+        if (imagePart) {
+          imageParts.push(imagePart)
+        }
       }
-      // Skip image, document, thinking, cache_edits, etc.
     }
 
-    if (textParts.length > 0) {
+    // CRITICAL: tool messages must come BEFORE any user message in the result.
+    // OpenAI API requires that a tool message immediately follows the assistant
+    // message with tool_calls. If we emit a user message first, the API will
+    // reject the request with "insufficient tool messages following tool_calls".
+    // See: https://github.com/anthropics/claude-code/issues/xxx
+    for (const tr of toolResults) {
+      result.push(convertToolResult(tr))
+    }
+
+    // 如果有图片，构建多模态 content 数组
+    if (imageParts.length > 0) {
+      const multiContent: Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }> = []
+      if (textParts.length > 0) {
+        multiContent.push({ type: 'text', text: textParts.join('\n') })
+      }
+      multiContent.push(...imageParts)
+      result.push({
+        role: 'user',
+        content: multiContent,
+      } satisfies ChatCompletionUserMessageParam)
+    } else if (textParts.length > 0) {
       result.push({
         role: 'user',
         content: textParts.join('\n'),
       } satisfies ChatCompletionUserMessageParam)
-    }
-
-    for (const tr of toolResults) {
-      result.push(convertToolResult(tr))
     }
   }
 
@@ -181,4 +202,39 @@ function convertInternalAssistantMessage(
   }
 
   return [result]
+}
+
+/**
+ * 将 Anthropic image 块转换为 OpenAI image_url 格式。
+ *
+ * Anthropic 格式: { type: "image", source: { type: "base64", media_type: "image/png", data: "..." } }
+ * OpenAI 格式: { type: "image_url", image_url: { url: "data:image/png;base64,..." } }
+ */
+function convertImageBlockToOpenAI(
+  block: Record<string, unknown>,
+): { type: 'image_url'; image_url: { url: string } } | null {
+  const source = block.source as Record<string, unknown> | undefined
+  if (!source) return null
+
+  if (source.type === 'base64' && typeof source.data === 'string') {
+    const mediaType = (source.media_type as string) || 'image/png'
+    return {
+      type: 'image_url',
+      image_url: {
+        url: `data:${mediaType};base64,${source.data}`,
+      },
+    }
+  }
+
+  // url 类型的图片直接传递
+  if (source.type === 'url' && typeof source.url === 'string') {
+    return {
+      type: 'image_url',
+      image_url: {
+        url: source.url,
+      },
+    }
+  }
+
+  return null
 }

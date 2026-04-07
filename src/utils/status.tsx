@@ -1,7 +1,7 @@
 import chalk from 'chalk'
 import figures from 'figures'
 import * as React from 'react'
-import { color, Text } from '../ink.js'
+import { color, Text } from '@anthropic/ink'
 import type { MCPServerConnection } from '../services/mcp/types.js'
 import { getAccountInformation, isClaudeAISubscriber } from './auth.js'
 import {
@@ -339,8 +339,8 @@ export function buildAPIProviderProperties(): Property[] {
       bedrock: 'AWS Bedrock',
       vertex: 'Google Vertex AI',
       foundry: 'Microsoft Foundry',
+      gemini: 'Gemini API'
     }[apiProvider]
-
     properties.push({
       label: 'API provider',
       value: providerLabel,
@@ -423,6 +423,13 @@ export function buildAPIProviderProperties(): Property[] {
         value: 'Microsoft Foundry auth skipped',
       })
     }
+  } else if (apiProvider === 'gemini') {
+    const geminiBaseUrl =
+      process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta'
+    properties.push({
+      label: 'Gemini base URL',
+      value: geminiBaseUrl,
+    })
   }
 
   const proxyUrl = getProxyUrl()

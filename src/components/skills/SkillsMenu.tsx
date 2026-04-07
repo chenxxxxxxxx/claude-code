@@ -8,7 +8,7 @@ import {
   getCommandName,
   type PromptCommand,
 } from '../../commands.js'
-import { Box, Text } from '../../ink.js'
+import { Box, Text } from '@anthropic/ink'
 import {
   estimateSkillFrontmatterTokens,
   getSkillsPath,
@@ -21,7 +21,7 @@ import {
 } from '../../utils/settings/constants.js'
 import { plural } from '../../utils/stringUtils.js'
 import { ConfigurableShortcutHint } from '../ConfigurableShortcutHint.js'
-import { Dialog } from '../design-system/Dialog.js'
+import { Dialog } from '@anthropic/ink'
 
 // Skills are always PromptCommands with CommandBase properties
 type SkillCommand = CommandBase & PromptCommand
@@ -139,6 +139,22 @@ export function SkillsMenu({ onExit, commands }: Props): React.ReactNode {
     )
   }
 
+  const getScopeTag = (
+    source: SkillSource,
+  ): { label: string; color: string } | undefined => {
+    switch (source) {
+      case 'projectSettings':
+      case 'localSettings':
+        return { label: 'local', color: 'yellow' }
+      case 'userSettings':
+        return { label: 'global', color: 'cyan' }
+      case 'policySettings':
+        return { label: 'managed', color: 'magenta' }
+      default:
+        return undefined
+    }
+  }
+
   const renderSkill = (skill: SkillCommand) => {
     const estimatedTokens = estimateSkillFrontmatterTokens(skill)
     const tokenDisplay = `~${formatTokens(estimatedTokens)}`
@@ -146,10 +162,14 @@ export function SkillsMenu({ onExit, commands }: Props): React.ReactNode {
       skill.source === 'plugin'
         ? skill.pluginInfo?.pluginManifest.name
         : undefined
+    const scopeTag = getScopeTag(skill.source as SkillSource)
 
     return (
       <Box key={`${skill.name}-${skill.source}`}>
         <Text>{getCommandName(skill)}</Text>
+        {scopeTag && (
+          <Text color={scopeTag.color}> [{scopeTag.label}]</Text>
+        )}
         <Text dimColor>
           {pluginName ? ` · ${pluginName}` : ''} · {tokenDisplay} description
           tokens
@@ -187,7 +207,9 @@ export function SkillsMenu({ onExit, commands }: Props): React.ReactNode {
     >
       <Box flexDirection="column" gap={1}>
         {renderSkillGroup('projectSettings')}
+        {renderSkillGroup('localSettings')}
         {renderSkillGroup('userSettings')}
+        {renderSkillGroup('flagSettings')}
         {renderSkillGroup('policySettings')}
         {renderSkillGroup('plugin')}
         {renderSkillGroup('mcp')}
